@@ -382,3 +382,182 @@ describe('cross-origin resource policy header', () => {
     }
   );
 });
+
+// A cross-site page must not be able to trigger the state-changing
+// `/webpack-dev-server/invalidate` endpoint (cross-site request forgery).
+describe('cross-site request forgery on state-changing endpoints', () => {
+  const devServerPort = port1;
+  const endpoint = '/webpack-dev-server/invalidate';
+
+  function request(path, headers) {
+    return new Promise((resolve, reject) => {
+      const req = http.get(
+        {
+          host: 'localhost',
+          port: devServerPort,
+          path,
+          headers: headers || {},
+        },
+        (res) => {
+          let body = '';
+          res.on('data', (chunk) => {
+            body += chunk;
+          });
+          res.on('end', () => {
+            resolve({ status: res.statusCode, body });
+          });
+        }
+      );
+      req.on('error', reject);
+    });
+  }
+
+  // Starts the dev server, requests the invalidate endpoint and resolves with
+  // the response plus whether a rebuild was triggered, closing the dev server
+  // afterwards whatever the outcome.
+  // TODO: use async/await when Node.js v6 support is dropped
+  function requestInvalidate(devServerOptions, headers) {
+    let invalidateSpy;
+    const close = () => new Promise((resolve) => testServer.close(resolve));
+
+    return new Promise((resolve) => {
+      const server = testServer.startAwaitingCompilation(
+        config,
+        Object.assign({ port: devServerPort }, devServerOptions),
+        resolve
+      );
+
+      invalidateSpy = jest.spyOn(server, 'invalidate');
+    })
+      .then(() => request(endpoint, headers))
+      .then(
+        (res) =>
+          close().then(() =>
+            Object.assign(
+              { invalidated: invalidateSpy.mock.calls.length > 0 },
+              res
+            )
+          ),
+        (error) =>
+          close().then(() => {
+            throw error;
+          })
+      );
+  }
+
+  it(`should block cross-site requests to ${endpoint}`, () => {
+    // what a browser sends for fetch() from an attacker's page
+    return requestInvalidate(
+      {},
+      {
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(403);
+      expect(res.body).toBe('Cross-Origin request blocked');
+      expect(res.invalidated).toBe(false);
+    });
+  });
+
+  it(`should block cross-site navigations to ${endpoint}`, () => {
+    // what a browser sends for a link/form on an attacker's page
+    return requestInvalidate(
+      {},
+      {
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'cross-site',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(403);
+      expect(res.invalidated).toBe(false);
+    });
+  });
+
+  it(`should block same-site (non same-origin) requests to ${endpoint}`, () => {
+    return requestInvalidate(
+      {},
+      {
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(403);
+      expect(res.invalidated).toBe(false);
+    });
+  });
+
+  it(`should block cross-site requests to ${endpoint} when the host is in 'allowedHosts'`, () => {
+    // 'allowedHosts' bypasses the global cross-origin header check
+    return requestInvalidate(
+      { allowedHosts: ['localhost'] },
+      {
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(403);
+      expect(res.invalidated).toBe(false);
+    });
+  });
+
+  it(`should block requests to ${endpoint} with a cross-origin Origin and no Sec-Fetch metadata`, () => {
+    return requestInvalidate({}, { origin: 'http://evil.example' }).then(
+      (res) => {
+        expect(res.status).toBe(403);
+        expect(res.invalidated).toBe(false);
+      }
+    );
+  });
+
+  it(`should block requests to ${endpoint} over a LAN IP with a cross-origin Origin and no Sec-Fetch metadata`, () => {
+    // browsers send no Sec-Fetch-* headers over plain HTTP to a LAN IP
+    return requestInvalidate(
+      {},
+      {
+        Host: `192.168.1.10:${devServerPort}`,
+        origin: 'http://attacker.example.com',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(403);
+      expect(res.invalidated).toBe(false);
+    });
+  });
+
+  it(`should allow same-origin requests to ${endpoint}`, () => {
+    return requestInvalidate(
+      {},
+      {
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+      }
+    ).then((res) => {
+      expect(res.status).toBe(200);
+      expect(res.invalidated).toBe(true);
+    });
+  });
+
+  it(`should allow user-initiated navigations to ${endpoint}`, () => {
+    return requestInvalidate({}, { 'sec-fetch-site': 'none' }).then((res) => {
+      expect(res.status).toBe(200);
+      expect(res.invalidated).toBe(true);
+    });
+  });
+
+  it(`should allow requests to ${endpoint} with a same-origin Origin and no Sec-Fetch metadata`, () => {
+    return requestInvalidate(
+      {},
+      { origin: `http://localhost:${devServerPort}` }
+    ).then((res) => {
+      expect(res.status).toBe(200);
+      expect(res.invalidated).toBe(true);
+    });
+  });
+
+  it(`should allow requests to ${endpoint} without Sec-Fetch metadata or Origin (e.g. curl)`, () => {
+    return requestInvalidate({}).then((res) => {
+      expect(res.status).toBe(200);
+      expect(res.invalidated).toBe(true);
+    });
+  });
+});
