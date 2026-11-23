@@ -9,6 +9,7 @@ const webpack = require('webpack');
 const Server = require('../lib/Server');
 const schema = require('../lib/options.json');
 const config = require('./fixtures/simple-config/webpack.config');
+const mockThrowingUrlParse = require('./helpers/throwing-url-parse');
 
 const messages = schema.errorMessage.properties;
 
@@ -291,6 +292,124 @@ describe('Validation', () => {
 
       tests.forEach((headers) => {
         expect(server.checkOrigin(headers)).toBe(true);
+      });
+    });
+
+    describe('malformed Host/Origin headers', () => {
+      // an invalid IPv6 literal, which `url.parse()` throws on since Node.js 18
+      const malformedHost = '[::1';
+      const malformedOrigin = 'http://[::1/';
+      // the `url.parse()` inputs built from them
+      const malformedInputs = [`//${malformedHost}`, malformedOrigin];
+      // a host-less origin, whose hostname `url.parse()` leaves `null`
+      const hostlessOrigin = 'javascript://evil.example.com';
+
+      let urlParseSpy = null;
+
+      afterEach(() => {
+        if (urlParseSpy) {
+          urlParseSpy.mockRestore();
+          urlParseSpy = null;
+        }
+      });
+
+      it('should not throw on malformed Host/Origin headers parsed leniently by url.parse()', () => {
+        server = new Server(compiler, {});
+
+        const malformedHostHeaders = {
+          origin: 'http://localhost:8080',
+          host: malformedHost,
+        };
+        const malformedOriginHeaders = {
+          origin: malformedOrigin,
+          host: 'localhost:8080',
+        };
+
+        expect(() => server.checkHost(malformedHostHeaders)).not.toThrow();
+        expect(() =>
+          server.checkHeaders(malformedHostHeaders, 'host', true, false)
+        ).not.toThrow();
+        expect(server.isSameOrigin(malformedHostHeaders)).toBe(false);
+        expect(
+          server.isSameOriginRequest({ headers: malformedHostHeaders })
+        ).toBe(false);
+
+        expect(server.isSameOrigin(malformedOriginHeaders)).toBe(false);
+        expect(server.checkOrigin(malformedOriginHeaders)).toBe(false);
+        expect(server.checkHeaders(malformedOriginHeaders, 'origin')).toBe(
+          false
+        );
+        expect(
+          server.isSameOriginRequest({ headers: malformedOriginHeaders })
+        ).toBe(false);
+      });
+
+      it('should reject a malformed Host header when url.parse() throws on it (Node.js >= 18)', () => {
+        server = new Server(compiler, {});
+        urlParseSpy = mockThrowingUrlParse(malformedInputs);
+
+        const headers = {
+          origin: 'http://localhost:8080',
+          host: malformedHost,
+        };
+
+        expect(server.checkHost(headers)).toBe(false);
+        expect(server.checkHeaders(headers, 'host', true, false)).toBe(false);
+        expect(server.isSameOrigin(headers)).toBe(false);
+        expect(server.isSameOriginRequest({ headers })).toBe(false);
+        expect(urlParseSpy).toHaveBeenCalledWith(
+          `//${malformedHost}`,
+          false,
+          true
+        );
+      });
+
+      it('should reject a malformed Origin header when url.parse() throws on it (Node.js >= 18)', () => {
+        server = new Server(compiler, {});
+        urlParseSpy = mockThrowingUrlParse(malformedInputs);
+
+        const headers = {
+          origin: malformedOrigin,
+          host: 'localhost:8080',
+        };
+
+        expect(server.checkHost(headers)).toBe(true);
+        expect(server.isSameOrigin(headers)).toBe(false);
+        expect(server.checkOrigin(headers)).toBe(false);
+        expect(server.checkHeaders(headers, 'origin')).toBe(false);
+        expect(server.isSameOriginRequest({ headers })).toBe(false);
+        expect(urlParseSpy).toHaveBeenCalledWith(malformedOrigin, false, true);
+      });
+
+      it('should reject a host-less Origin header matched against a wildcard in allowedHosts', () => {
+        server = new Server(compiler, { allowedHosts: ['.example.com'] });
+
+        const headers = {
+          origin: hostlessOrigin,
+          host: 'localhost:8080',
+        };
+
+        expect(server.checkHost(headers)).toBe(true);
+        expect(server.checkOrigin(headers)).toBe(false);
+        expect(server.checkHeaders(headers, 'origin')).toBe(false);
+        // a well-formed origin under the wildcard is still allowed
+        expect(
+          server.checkOrigin({
+            origin: 'http://www.example.com',
+            host: 'localhost:8080',
+          })
+        ).toBe(true);
+      });
+
+      it('should reject a host-less Host header matched against a wildcard in allowedHosts', () => {
+        server = new Server(compiler, { allowedHosts: ['.example.com'] });
+
+        const headers = { host: hostlessOrigin };
+
+        expect(server.checkHost(headers)).toBe(false);
+        expect(server.checkHeaders(headers, 'host', true, false)).toBe(false);
+        // a well-formed host under the wildcard is still allowed
+        expect(server.checkHost({ host: 'www.example.com:8080' })).toBe(true);
       });
     });
 

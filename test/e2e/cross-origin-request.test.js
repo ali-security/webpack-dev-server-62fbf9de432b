@@ -1,8 +1,11 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const internalIp = require('internal-ip');
+const WebSocket = require('ws');
 const testServer = require('../helpers/test-server');
+const mockThrowingUrlParse = require('../helpers/throwing-url-parse');
 const config = require('../fixtures/client-config/webpack.config');
 const runBrowser = require('../helpers/run-browser');
 const [port1, port2] = require('../ports-map')['cross-origin-request'];
@@ -558,6 +561,276 @@ describe('cross-site request forgery on state-changing endpoints', () => {
     return requestInvalidate({}).then((res) => {
       expect(res.status).toBe(200);
       expect(res.invalidated).toBe(true);
+    });
+  });
+});
+
+// A malformed `Host` or `Origin` header value must be rejected, not throw while
+// it is being validated: thrown from the socket server's connection handler,
+// the error takes down the whole dev server process.
+// See https://github.com/webpack/webpack-dev-server/commit/f21ed0f44aceb6132abb591ee8b60d770b6e489f
+describe('malformed Host/Origin headers', () => {
+  const devServerPort = port1;
+  const invalidHeaderMessage = JSON.stringify({
+    type: 'error',
+    data: 'Invalid Host/Origin header',
+  });
+  // an invalid IPv6 literal, which `url.parse()` throws on since Node.js 18
+  const malformedHost = '[::1';
+  const malformedOrigin = 'http://[::1/';
+  // a host-less origin, whose hostname `url.parse()` leaves `null`
+  const hostlessOrigin = 'javascript://evil.example.com';
+
+  let urlParseSpy = null;
+
+  afterEach(() => {
+    if (urlParseSpy) {
+      urlParseSpy.mockRestore();
+      urlParseSpy = null;
+    }
+  });
+
+  // the older Node.js versions under test parse the malformed values
+  // leniently, so make `url.parse()` throw on them like Node.js >= 18 does
+  function mockUrlParse() {
+    urlParseSpy = mockThrowingUrlParse([`//${malformedHost}`, malformedOrigin]);
+  }
+
+  function request(path, headers) {
+    return new Promise((resolve, reject) => {
+      const req = http.get(
+        {
+          host: 'localhost',
+          port: devServerPort,
+          path,
+          headers: headers || {},
+        },
+        (res) => {
+          let body = '';
+          res.on('data', (chunk) => {
+            body += chunk;
+          });
+          res.on('end', () => {
+            resolve({ status: res.statusCode, body });
+          });
+        }
+      );
+      req.on('error', reject);
+    });
+  }
+
+  // connects a websocket client sending the given headers and collects the
+  // messages until the dev server closes the connection
+  function connectSocket(socketPath, headers) {
+    return new Promise((resolve) => {
+      const result = { messages: [], closed: false };
+      const client = new WebSocket(
+        `ws://localhost:${devServerPort}${socketPath}`,
+        { headers }
+      );
+      let finished = false;
+      let timer = null;
+
+      const finish = () => {
+        if (finished) {
+          return;
+        }
+
+        finished = true;
+        clearTimeout(timer);
+
+        // state of the connection before the client terminates it
+        const state = {
+          messages: result.messages.slice(),
+          closed: result.closed,
+        };
+
+        client.terminate();
+        resolve(state);
+      };
+
+      timer = setTimeout(finish, 5000);
+
+      client.on('message', (message) => {
+        result.messages.push(message);
+      });
+
+      client.on('close', () => {
+        result.closed = true;
+        finish();
+      });
+
+      client.on('error', () => {});
+    });
+  }
+
+  // sends a request over a raw socket, so the malformed Host header reaches
+  // the dev server as-is, and resolves with the raw response
+  function rawRequest(path, host) {
+    return new Promise((resolve) => {
+      let response = '';
+      const socket = net.connect(devServerPort, 'localhost', () => {
+        socket.write(
+          [
+            `GET ${path} HTTP/1.1`,
+            `Host: ${host}`,
+            'Connection: close',
+            '',
+            '',
+          ].join('\r\n')
+        );
+      });
+
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        response += chunk;
+      });
+      socket.on('close', () => resolve(response));
+      socket.on('error', () => resolve(response));
+    });
+  }
+
+  // Starts the dev server, runs `attack` against it and then checks the dev
+  // server is still alive by requesting the bundle. Resolves with the result
+  // of the attack and the status of the bundle request, closing the dev
+  // server afterwards whatever the outcome.
+  // TODO: use async/await when Node.js v6 support is dropped
+  function attackDevServer(devServerOptions, attack) {
+    let server;
+    const close = () => new Promise((resolve) => testServer.close(resolve));
+
+    return new Promise((resolve) => {
+      server = testServer.startAwaitingCompilation(
+        config,
+        Object.assign({ port: devServerPort }, devServerOptions),
+        resolve
+      );
+    })
+      .then(() => attack(server))
+      .then((result) =>
+        request('/main.js').then((res) => {
+          return { result, bundleStatus: res.status };
+        })
+      )
+      .then(
+        (outcome) => close().then(() => outcome),
+        (error) =>
+          close().then(() => {
+            throw error;
+          })
+      );
+  }
+
+  [
+    {
+      title: 'ws',
+      transportMode: 'ws',
+      socketPath: '/sockjs-node',
+    },
+    {
+      title: 'sockjs',
+      transportMode: 'sockjs',
+      // raw websocket endpoint of sockjs
+      socketPath: '/sockjs-node/websocket',
+    },
+  ].forEach((transport) => {
+    describe(`websocket connections ("${transport.title}")`, () => {
+      [
+        {
+          title: 'a malformed Origin header',
+          headers: {
+            host: `localhost:${devServerPort}`,
+            origin: malformedOrigin,
+          },
+          mockUrlParse: true,
+        },
+        {
+          title: 'a malformed Host header',
+          headers: { host: malformedHost },
+          mockUrlParse: true,
+        },
+        {
+          title: "a host-less Origin header and a wildcard in 'allowedHosts'",
+          options: { allowedHosts: ['.example.com'] },
+          headers: {
+            host: `localhost:${devServerPort}`,
+            origin: hostlessOrigin,
+          },
+        },
+        {
+          title: "a host-less Host header and a wildcard in 'allowedHosts'",
+          options: { allowedHosts: ['.example.com'] },
+          headers: { host: hostlessOrigin },
+        },
+      ].forEach((data) => {
+        it(`should reject a connection with ${data.title} without crashing`, () => {
+          return attackDevServer(
+            Object.assign(
+              { transportMode: transport.transportMode },
+              data.options
+            ),
+            () => {
+              if (data.mockUrlParse) {
+                mockUrlParse();
+              }
+
+              return connectSocket(transport.socketPath, data.headers);
+            }
+          ).then((outcome) => {
+            expect(outcome.result.messages).toContain(invalidHeaderMessage);
+            expect(outcome.result.closed).toBe(true);
+            // the dev server is still alive
+            expect(outcome.bundleStatus).toBe(200);
+          });
+        });
+      });
+    });
+  });
+
+  [
+    {
+      title: 'a malformed Host header',
+      host: malformedHost,
+      mockUrlParse: true,
+    },
+    {
+      title: "a host-less Host header and a wildcard in 'allowedHosts'",
+      options: { allowedHosts: ['.example.com'] },
+      host: hostlessOrigin,
+    },
+  ].forEach((data) => {
+    it(`should reject a request with ${data.title} without crashing`, () => {
+      return attackDevServer(data.options, () => {
+        if (data.mockUrlParse) {
+          mockUrlParse();
+        }
+
+        return rawRequest('/main.js', data.host);
+      }).then((outcome) => {
+        expect(outcome.result).toMatch(/^HTTP\/1\.1 200 /);
+        expect(outcome.result).toContain('Invalid Host header');
+        // the dev server is still alive
+        expect(outcome.bundleStatus).toBe(200);
+      });
+    });
+  });
+
+  it('should reject a request to /webpack-dev-server/invalidate with a malformed Origin header', () => {
+    let invalidateSpy;
+
+    return attackDevServer({}, (server) => {
+      invalidateSpy = jest.spyOn(server, 'invalidate');
+      mockUrlParse();
+
+      return request('/webpack-dev-server/invalidate', {
+        origin: malformedOrigin,
+      });
+    }).then((outcome) => {
+      expect(outcome.result.status).toBe(403);
+      expect(outcome.result.body).toBe('Cross-Origin request blocked');
+      expect(invalidateSpy).not.toHaveBeenCalled();
+      // the dev server is still alive
+      expect(outcome.bundleStatus).toBe(200);
     });
   });
 });
