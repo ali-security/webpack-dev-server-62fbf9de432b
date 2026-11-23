@@ -4,6 +4,7 @@
   class-methods-use-this
 */
 const request = require('supertest');
+const WebSocket = require('ws');
 const sockjs = require('sockjs');
 const SockJS = require('sockjs-client/dist/sockjs');
 const SockJSServer = require('../../lib/servers/SockJSServer');
@@ -434,6 +435,115 @@ describe('transportMode', () => {
             expect(data).toMatchSnapshot();
             done();
           }, 5000);
+        });
+      });
+
+      describe('with an IP address in the origin header', () => {
+        const invalidHeaderMessage = JSON.stringify({
+          type: 'error',
+          data: 'Invalid Host/Origin header',
+        });
+
+        // connects a raw websocket client sending the given Origin header and
+        // collects the messages until the server closes the connection
+        // (or until the first message when `untilFirstMessage` is set)
+        const connect = (socketUrl, origin, untilFirstMessage) =>
+          new Promise((resolve) => {
+            const result = { messages: [], closed: false };
+            const client = new WebSocket(socketUrl, { origin });
+            let finished = false;
+            let timer = null;
+
+            const finish = () => {
+              if (finished) {
+                return;
+              }
+
+              finished = true;
+              clearTimeout(timer);
+
+              // state of the connection before the client terminates it
+              const state = {
+                messages: result.messages.slice(),
+                closed: result.closed,
+              };
+
+              client.terminate();
+              resolve(state);
+            };
+
+            timer = setTimeout(finish, 5000);
+
+            client.on('message', (message) => {
+              result.messages.push(message);
+
+              if (untilFirstMessage) {
+                finish();
+              }
+            });
+
+            client.on('close', () => {
+              result.closed = true;
+              finish();
+            });
+
+            client.on('error', () => {});
+          });
+
+        [
+          {
+            title: 'ws',
+            transportMode: 'ws',
+            sockPath: '/sockjs-node',
+          },
+          {
+            title: 'sockjs',
+            transportMode: 'sockjs',
+            // raw websocket endpoint of sockjs
+            sockPath: '/sockjs-node/websocket',
+          },
+        ].forEach((data) => {
+          describe(`("${data.title}")`, () => {
+            beforeEach((done) => {
+              server = testServer.start(
+                config,
+                {
+                  port,
+                  transportMode: data.transportMode,
+                },
+                done
+              );
+            });
+
+            it('should disconnect a client with an IP address origin connecting through localhost', () =>
+              connect(
+                `ws://localhost:${port}${data.sockPath}`,
+                'http://192.168.1.1/'
+              ).then((result) => {
+                expect(result.messages).toEqual([invalidHeaderMessage]);
+                expect(result.closed).toBe(true);
+              }));
+
+            it('should disconnect a client with an IP address origin connecting through another IP address', () =>
+              connect(
+                `ws://127.0.0.1:${port}${data.sockPath}`,
+                `http://192.168.1.1:${port}`
+              ).then((result) => {
+                expect(result.messages).toEqual([invalidHeaderMessage]);
+                expect(result.closed).toBe(true);
+              }));
+
+            it('should accept a client with the same IP address origin as the host', () =>
+              connect(
+                `ws://127.0.0.1:${port}${data.sockPath}`,
+                `http://127.0.0.1:${port}`,
+                true
+              ).then((result) => {
+                expect(result.messages.length).toBeGreaterThan(0);
+                expect(result.messages).not.toContain(invalidHeaderMessage);
+                expect(result.closed).toBe(false);
+              }));
+          });
         });
       });
     });

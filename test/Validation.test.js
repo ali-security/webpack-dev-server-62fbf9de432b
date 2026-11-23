@@ -212,6 +212,88 @@ describe('Validation', () => {
       }
     });
 
+    it('should not allow an IP address in the origin header when it differs from the host header', () => {
+      const options = {};
+
+      const tests = [
+        { origin: 'http://192.168.1.1', host: 'localhost:8080' },
+        { origin: 'http://192.168.1.1/', host: 'localhost' },
+        { origin: 'https://192.168.1.1:8080', host: '127.0.0.1:8080' },
+        { origin: 'http://192.168.1.1:8080', host: '192.168.1.2:8080' },
+        { origin: 'http://[::1]:8080', host: 'localhost:8080' },
+        {
+          origin: 'http://[ad42::1de2:54c2:c2fa:1234]',
+          host: '[::1]:8080',
+        },
+        { origin: 'http://192.168.1.1' },
+      ];
+
+      server = new Server(compiler, options);
+
+      tests.forEach((headers) => {
+        expect(server.checkHost({ host: headers.host || 'localhost' })).toBe(
+          true
+        );
+        expect(server.checkOrigin(headers)).toBe(false);
+        expect(server.checkHeaders(headers, 'origin')).toBe(false);
+      });
+    });
+
+    it('should allow an IP address in the origin header when it matches the host header', () => {
+      const options = {};
+
+      const tests = [
+        { origin: 'http://127.0.0.1:8080', host: '127.0.0.1:8080' },
+        { origin: 'http://192.168.1.1', host: '192.168.1.1:8080' },
+        { origin: 'https://[::1]:8080', host: '[::1]:8080' },
+        {
+          origin: 'http://[ad42::1de2:54c2:c2fa:1234]',
+          host: '[ad42::1de2:54c2:c2fa:1234]:8080',
+        },
+      ];
+
+      server = new Server(compiler, options);
+
+      tests.forEach((headers) => {
+        expect(server.checkHost(headers)).toBe(true);
+        expect(server.checkOrigin(headers)).toBe(true);
+      });
+    });
+
+    it('should allow an IP address in the origin header if options.disableHostCheck is set', () => {
+      const options = {
+        disableHostCheck: true,
+      };
+
+      const headers = {
+        origin: 'http://192.168.1.1',
+        host: 'localhost:8080',
+      };
+
+      server = new Server(compiler, options);
+
+      expect(server.checkOrigin(headers)).toBe(true);
+    });
+
+    it('should still allow non-IP origins that are allowed', () => {
+      const options = {
+        public: 'test.host:80',
+        allowedHosts: ['.example.com'],
+      };
+
+      const tests = [
+        { origin: 'http://localhost:8080', host: '127.0.0.1:8080' },
+        { origin: 'https://test.host', host: '192.168.1.1:8080' },
+        { origin: 'http://www.example.com', host: 'localhost:8080' },
+      ];
+
+      server = new Server(compiler, options);
+
+      tests.forEach((headers) => {
+        expect(server.checkOrigin(headers)).toBe(true);
+      });
+    });
+
     describe('allowedHosts', () => {
       it('should allow hosts in allowedHosts', () => {
         const tests = ['test.host', 'test2.host', 'test3.host'];
