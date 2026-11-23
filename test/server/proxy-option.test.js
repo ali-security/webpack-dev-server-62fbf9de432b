@@ -300,7 +300,9 @@ describe('proxy option', () => {
         });
 
         beforeEach((done) => {
-          ws = new WebSocket(`ws://localhost:${port3}/proxy3/socket`);
+          ws = new WebSocket(`ws://localhost:${port3}/proxy3/socket`, {
+            origin: `http://localhost:${port3}`,
+          });
           ws.on('message', (message) => {
             responseMessage = message;
             done();
@@ -399,11 +401,16 @@ describe('proxy option', () => {
 
     // Open a WebSocket to `urlPath` on the dev server and report whether the
     // handshake completed (`opened`), the messages received and whether the
-    // upgrade was forwarded to the proxy target (`forwarded`).
+    // upgrade was forwarded to the proxy target (`forwarded`). Proxied upgrades
+    // are only forwarded for a trusted Origin, so the dev server's own origin is
+    // sent unless `options` overrides it.
     const probe = (urlPath, options) => {
       const before = backendUpgrades.length;
       const messages = [];
-      const ws = new WebSocket(`ws://localhost:${port3}${urlPath}`, options);
+      const ws = new WebSocket(
+        `ws://localhost:${port3}${urlPath}`,
+        Object.assign({ origin: devServerOrigin }, options)
+      );
 
       ws.on('message', (data) => {
         messages.push(data.toString());
